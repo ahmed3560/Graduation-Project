@@ -1,0 +1,29 @@
+# --- Secrets: never commit real values ---
+.env
+.env.*
+!.env.example
+!web/.env.example
+
+# --- Go build and test output ---
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# --- Node / frontend ---
+node_modules/
+web/dist/
+web/.vite/
+web/coverage/
+*.local
+
+# --- Logs and scratch files ---
+*.log
+structure.txt
+
+# --- OS and editor files ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
