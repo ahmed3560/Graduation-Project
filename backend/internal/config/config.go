@@ -1,14 +1,22 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
 )
 
+const (
+	EnvDevelopment = "development"
+	EnvTest        = "test"
+	EnvProduction  = "production"
+)
+
 type Config struct {
-	Env string // "development" or "production"
+	Env string // EnvDevelopment, EnvTest, or EnvProduction
 
 	Server struct {
 		Port            string
@@ -32,68 +40,135 @@ type Config struct {
 	}
 }
 
+// Load reads every setting, then checks them together.
+// It returns all problems at once, so the operator can fix them in one pass.
 func Load() (Config, error) {
+	l := &loader{}
 	var cfg Config
 
-	cfg.Env = getEnv("APP_ENV", "development")
+	cfg.Env = l.str("APP_ENV", EnvDevelopment)
 
-	// Server
-	cfg.Server.Port = getEnv("PORT", "8080")
-	cfg.Server.ReadTimeout = getDuration("SERVER_READ_TIMEOUT", 10*time.Second)
-	cfg.Server.WriteTimeout = getDuration("SERVER_WRITE_TIMEOUT", 15*time.Second)
-	cfg.Server.IdleTimeout = getDuration("SERVER_IDLE_TIMEOUT", 60*time.Second)
-	cfg.Server.ShutdownTimeout = getDuration("SERVER_SHUTDOWN_TIMEOUT", 10*time.Second)
+	cfg.Server.Port = strconv.Itoa(l.intRange("PORT", 8080, 1, 65535))
+	cfg.Server.ReadTimeout = l.duration("SERVER_READ_TIMEOUT", 10*time.Second)
+	cfg.Server.WriteTimeout = l.duration("SERVER_WRITE_TIMEOUT", 15*time.Second)
+	cfg.Server.IdleTimeout = l.duration("SERVER_IDLE_TIMEOUT", 60*time.Second)
+	cfg.Server.ShutdownTimeout = l.duration("SERVER_SHUTDOWN_TIMEOUT", 10*time.Second)
 
-	// Database
-	cfg.DB.URL = os.Getenv("DATABASE_URL")
-	if cfg.DB.URL == "" {
-		return Config{}, fmt.Errorf("config: DATABASE_URL is required")
+	cfg.DB.URL = l.required("DATABASE_URL")
+	cfg.DB.MaxConns = int32(l.intRange("DB_MAX_CONNS", 25, 1, 1000))
+	cfg.DB.MinConns = int32(l.intRange("DB_MIN_CONNS", 5, 0, 1000))
+	cfg.DB.MaxConnLifetime = l.duration("DB_MAX_CONN_LIFETIME", 30*time.Minute)
+
+	cfg.Auth.JWTSecret = l.required("JWT_SECRET")
+	cfg.Auth.AccessTokenTTL = l.duration("JWT_ACCESS_TTL", 15*time.Minute)
+	cfg.Auth.RefreshTokenTTL = l.duration("JWT_REFRESH_TTL", 7*24*time.Hour)
+
+	l.errs = append(l.errs, cfg.validate()...)
+	if len(l.errs) > 0 {
+		return Config{}, errors.Join(l.errs...)
 	}
-	cfg.DB.MaxConns = int32(getInt("DB_MAX_CONNS", 25))
-	cfg.DB.MinConns = int32(getInt("DB_MIN_CONNS", 5))
-	cfg.DB.MaxConnLifetime = getDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute)
-
-	// Auth
-	cfg.Auth.JWTSecret = os.Getenv("JWT_SECRET")
-	if cfg.Auth.JWTSecret == "" {
-		return Config{}, fmt.Errorf("config: JWT_SECRET is required")
-	}
-	if len(cfg.Auth.JWTSecret) < 32 {
-		return Config{}, fmt.Errorf("config: JWT_SECRET must be at least 32 characters")
-	}
-	cfg.Auth.AccessTokenTTL = getDuration("JWT_ACCESS_TTL", 15*time.Minute)
-	cfg.Auth.RefreshTokenTTL = getDuration("JWT_REFRESH_TTL", 7*24*time.Hour)
-
 	return cfg, nil
 }
 
-func getEnv(key, fallback string) string {
+// validate checks rules that involve more than one setting.
+// It skips empty values, because the loader has already reported those.
+func (c Config) validate() []error {
+	var errs []error
+
+	switch c.Env {
+	case EnvDevelopment, EnvTest, EnvProduction:
+	default:
+		errs = append(errs, fmt.Errorf("APP_ENV must be development, test, or production, got %q", c.Env))
+	}
+
+	if c.Auth.JWTSecret != "" && len(c.Auth.JWTSecret) < 32 {
+		errs = append(errs, errors.New("JWT_SECRET must be at least 32 characters"))
+	}
+	if c.DB.MinConns > c.DB.MaxConns {
+		errs = append(errs, fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", c.DB.MinConns, c.DB.MaxConns))
+	}
+	if c.Auth.RefreshTokenTTL <= c.Auth.AccessTokenTTL {
+		errs = append(errs, errors.New("JWT_REFRESH_TTL must be longer than JWT_ACCESS_TTL"))
+	}
+	return errs
+}
+
+// String implements fmt.Stringer, so fmt.Println and %v never print secrets.
+// Note: %#v and json.Marshal bypass this method, so don't log the struct that way.
+func (c Config) String() string {
+	return fmt.Sprintf(
+		"Config{Env:%s Port:%s DBURL:%s DBMaxConns:%d DBMinConns:%d JWTSecret:[REDACTED] AccessTokenTTL:%s RefreshTokenTTL:%s}",
+		c.Env, c.Server.Port, redactURL(c.DB.URL), c.DB.MaxConns, c.DB.MinConns,
+		c.Auth.AccessTokenTTL, c.Auth.RefreshTokenTTL,
+	)
+}
+
+// redactURL hides the password in a URL like postgres://user:pass@host/db.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[REDACTED]"
+	}
+	if u.User == nil {
+		return u.String()
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+	}
+	return u.String()
+}
+
+// loader collects errors while reading environment variables.
+type loader struct {
+	errs []error
+}
+
+func (l *loader) fail(format string, args ...any) {
+	l.errs = append(l.errs, fmt.Errorf(format, args...))
+}
+
+// str returns the variable or the fallback when it's unset or empty.
+func (l *loader) str(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
 }
 
-func getInt(key string, fallback int) int {
+// required returns the variable and records an error if it's unset or empty.
+func (l *loader) required(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		return fallback
+		l.fail("%s is required", key)
 	}
-	parsed, err := strconv.Atoi(v)
-	if err != nil {
-		return fallback
-	}
-	return parsed
+	return v
 }
 
-func getDuration(key string, fallback time.Duration) time.Duration {
+// intRange parses a whole number. A value that is set but invalid is an error,
+// not a silent fallback.
+func (l *loader) intRange(key string, fallback, min, max int) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
-	parsed, err := time.ParseDuration(v)
-	if err != nil {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < min || n > max {
+		l.fail("%s must be a whole number from %d to %d, got %q", key, min, max, v)
 		return fallback
 	}
-	return parsed
+	return n
+}
+
+// duration parses a positive duration such as "15m" or "168h".
+func (l *loader) duration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		l.fail("%s must be a positive duration such as 15m or 168h, got %q", key, v)
+		return fallback
+	}
+	return d
 }
